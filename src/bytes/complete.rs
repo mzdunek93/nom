@@ -6,8 +6,8 @@ use crate::internal::{Err, IResult, Parser};
 use crate::lib::std::ops::RangeFrom;
 use crate::lib::std::result::Result::*;
 use crate::traits::{
-  Compare, CompareResult, FindSubstring, FindToken, InputIter, InputLength, InputTake,
-  InputTakeAtPosition, Slice, ToUsize,
+  Compare, CompareBiDir, CompareResult, FindSubstring, FindToken, InputIter, InputLength, InputTake,
+  InputTakeAtPosition, InputTakeAtPositionEnd, Slice, ToUsize,
 };
 
 /// Recognizes a pattern
@@ -42,6 +42,47 @@ where
     let t = tag.clone();
     let res: IResult<_, _, Error> = match i.compare(t) {
       CompareResult::Ok => Ok(i.take_split(tag_len)),
+      _ => {
+        let e: ErrorKind = ErrorKind::Tag;
+        Err(Err::Error(Error::from_error_kind(i, e)))
+      }
+    };
+    res
+  }
+}
+
+/// Recognizes a pattern at the end of the input
+///
+/// The input data will be compared to the tag combinator's argument and will return the part of
+/// the input that matches the argument
+///
+/// It will return `Err(Err::Error((_, ErrorKind::Tag)))` if the input doesn't match the pattern
+/// # Example
+/// ```rust
+/// # #[macro_use] extern crate nom;
+/// # use nom::{Err, error::ErrorKind, Needed, IResult};
+/// use nom::bytes::complete::tag;
+///
+/// fn parser(s: &str) -> IResult<&str, &str> {
+///   tag_end("World!")(s)
+/// }
+///
+/// assert_eq!(parser("Hello, World!"), Ok(("Hello, ", "World!")));
+/// assert_eq!(parser("Something"), Err(Err::Error(("Something", ErrorKind::Tag))));
+/// assert_eq!(parser(""), Err(Err::Error(("", ErrorKind::Tag))));
+/// ```
+pub fn tag_end<T, Input, Error: ParseError<Input>>(
+  tag: T,
+) -> impl Fn(Input) -> IResult<Input, Input, Error>
+where
+  Input: InputTake + CompareBiDir<T>,
+  T: InputLength + Clone,
+{
+  move |i: Input| {
+    let tag_len = tag.input_len();
+    let t = tag.clone();
+    let res: IResult<_, _, Error> = match i.compare_dir(t, false) {
+      CompareResult::Ok => Ok(i.take_split_end(tag_len)),
       _ => {
         let e: ErrorKind = ErrorKind::Tag;
         Err(Err::Error(Error::from_error_kind(i, e)))
@@ -86,6 +127,50 @@ where
 
     let res: IResult<_, _, Error> = match (i).compare_no_case(t) {
       CompareResult::Ok => Ok(i.take_split(tag_len)),
+      _ => {
+        let e: ErrorKind = ErrorKind::Tag;
+        Err(Err::Error(Error::from_error_kind(i, e)))
+      }
+    };
+    res
+  }
+}
+
+/// Recognizes a case insensitive pattern at the end of the input
+///
+/// The input data will be compared to the tag combinator's argument and will return the part of
+/// the input that matches the argument with no regard to case
+///
+/// It will return `Err(Err::Error((_, ErrorKind::Tag)))` if the input doesn't match the pattern
+/// # Example
+/// ```rust
+/// # #[macro_use] extern crate nom;
+/// # use nom::{Err, error::ErrorKind, Needed, IResult};
+/// use nom::bytes::complete::tag_no_case;
+///
+/// fn parser(s: &str) -> IResult<&str, &str> {
+///   tag_no_case_end("world!")(s)
+/// }
+///
+/// assert_eq!(parser("Hello, World!"), Ok(("Hello, ", "World!")));
+/// assert_eq!(parser("Hello, world!"), Ok(("Hello, ", "world!")));
+/// assert_eq!(parser("Hello, WoRlD!"), Ok(("Hello, ", "WoRlD!")));
+/// assert_eq!(parser("Something"), Err(Err::Error(("Something", ErrorKind::Tag))));
+/// assert_eq!(parser(""), Err(Err::Error(("", ErrorKind::Tag))));
+/// ```
+pub fn tag_no_case_end<T, Input, Error: ParseError<Input>>(
+  tag: T,
+) -> impl Fn(Input) -> IResult<Input, Input, Error>
+where
+  Input: InputTake + CompareBiDir<T>,
+  T: InputLength + Clone,
+{
+  move |i: Input| {
+    let tag_len = tag.input_len();
+    let t = tag.clone();
+
+    let res: IResult<_, _, Error> = match (i).compare_no_case_dir(t, false) {
+      CompareResult::Ok => Ok(i.take_split_end(tag_len)),
       _ => {
         let e: ErrorKind = ErrorKind::Tag;
         Err(Err::Error(Error::from_error_kind(i, e)))
@@ -197,6 +282,37 @@ where
   move |i: Input| i.split_at_position_complete(|c| !cond(c))
 }
 
+/// Returns the longest input slice from the end (if any) that matches the predicate
+///
+/// The parser will return the longest slice that matches the given predicate *(a function that
+/// takes the input and returns a bool)*
+///
+/// # Example
+/// ```rust
+/// # #[macro_use] extern crate nom;
+/// # use nom::{Err, error::ErrorKind, Needed, IResult};
+/// use nom::bytes::complete::take_while;
+/// use nom::character::is_alphabetic;
+///
+/// fn alpha(s: &[u8]) -> IResult<&[u8], &[u8]> {
+///   take_while_end(is_alphabetic)(s)
+/// }
+///
+/// assert_eq!(alpha(b"123latin"), Ok((&b"123"[..], &b"latin"[..])));
+/// assert_eq!(alpha(b"12345"), Ok((&b"12345"[..], &b""[..])));
+/// assert_eq!(alpha(b"latin"), Ok((&b""[..], &b"latin"[..])));
+/// assert_eq!(alpha(b""), Ok((&b""[..], &b""[..])));
+/// ```
+pub fn take_while_end<F, Input, Error: ParseError<Input>>(
+  cond: F,
+) -> impl Fn(Input) -> IResult<Input, Input, Error>
+where
+  Input: InputTakeAtPositionEnd,
+  F: Fn(<Input as InputTakeAtPositionEnd>::Item) -> bool,
+{
+  move |i: Input| i.split_at_position_end_complete(|c| !cond(c))
+}
+
 /// Returns the longest (atleast 1) input slice that matches the predicate
 ///
 /// The parser will return the longest slice that matches the given predicate *(a function that
@@ -229,6 +345,41 @@ where
   move |i: Input| {
     let e: ErrorKind = ErrorKind::TakeWhile1;
     i.split_at_position1_complete(|c| !cond(c), e)
+  }
+}
+
+/// Returns the longest (atleast 1) input slice from the end that matches the predicate
+///
+/// The parser will return the longest slice that matches the given predicate *(a function that
+/// takes the input and returns a bool)*
+///
+/// It will return an `Err(Err::Error((_, ErrorKind::TakeWhile1)))` if the pattern wasn't met
+///
+/// # Example
+/// ```rust
+/// # #[macro_use] extern crate nom;
+/// # use nom::{Err, error::ErrorKind, Needed, IResult};
+/// use nom::bytes::complete::take_while1;
+/// use nom::character::is_alphabetic;
+///
+/// fn alpha(s: &[u8]) -> IResult<&[u8], &[u8]> {
+///   take_while1_end(is_alphabetic)(s)
+/// }
+///
+/// assert_eq!(alpha(b"123latin"), Ok((&b"123"[..], &b"latin"[..])));
+/// assert_eq!(alpha(b"latin"), Ok((&b""[..], &b"latin"[..])));
+/// assert_eq!(alpha(b"12345"), Err(Err::Error((&b"12345"[..], ErrorKind::TakeWhile1))));
+/// ```
+pub fn take_while1_end<F, Input, Error: ParseError<Input>>(
+  cond: F,
+) -> impl Fn(Input) -> IResult<Input, Input, Error>
+where
+  Input: InputTakeAtPositionEnd,
+  F: Fn(<Input as InputTakeAtPositionEnd>::Item) -> bool,
+{
+  move |i: Input| {
+    let e: ErrorKind = ErrorKind::TakeWhile1;
+    i.split_at_position1_end_complete(|c| !cond(c), e)
   }
 }
 
@@ -725,6 +876,34 @@ where
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn complete_tag_end() {
+    let result: IResult<&str, &str> =
+      super::tag_end("World!")("Hello, World!");
+    assert_eq!(result, Ok(("Hello, ", "World!")));
+  }
+
+  #[test]
+  fn complete_tag_no_case_end() {
+    let result: IResult<&str, &str> =
+      super::tag_no_case_end("world!")("Hello, World!");
+    assert_eq!(result, Ok(("Hello, ", "World!")));
+  }
+
+  #[test]
+  fn complete_take_while_end() {
+    let result: IResult<&str, &str> =
+      super::take_while_end(|c: char| c.is_alphabetic())("12øn");
+    assert_eq!(result, Ok(("12", "øn")));
+  }
+
+  #[test]
+  fn complete_take_while_end_bytes() {
+    let result: IResult<&[u8], &[u8]> =
+      super::take_while_end(|c: u8| c == 32)("12  ".as_bytes());
+    assert_eq!(result, Ok(("12".as_bytes(), "  ".as_bytes())));
+  }
 
   #[test]
   fn complete_take_while_m_n_utf8_all_matching() {

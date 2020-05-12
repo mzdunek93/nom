@@ -310,10 +310,10 @@ pub trait InputIter {
   /// an iterator over the input type, producing the item and its position
   /// for use with [Slice]. If we're iterating over `&str`, the position
   /// corresponds to the byte index of the character
-  type Iter: Iterator<Item = (usize, Self::Item)>;
+  type Iter: DoubleEndedIterator<Item = (usize, Self::Item)>;
 
   /// an iterator over the input type, producing the item
-  type IterElem: Iterator<Item = Self::Item>;
+  type IterElem: DoubleEndedIterator<Item = Self::Item>;
 
   /// returns an iterator over the elements and their byte offsets
   fn iter_indices(&self) -> Self::Iter;
@@ -321,6 +321,10 @@ pub trait InputIter {
   fn iter_elements(&self) -> Self::IterElem;
   /// finds the byte position of the element
   fn position<P>(&self, predicate: P) -> Option<usize>
+  where
+    P: Fn(Self::Item) -> bool;
+  /// finds the byte position of the last element
+  fn position_last<P>(&self, predicate: P) -> Option<usize>
   where
     P: Fn(Self::Item) -> bool;
   /// get the byte offset from the element's position in the stream
@@ -333,6 +337,10 @@ pub trait InputTake: Sized {
   fn take(&self, count: usize) -> Self;
   /// split the stream at the `count` byte offset. panics if count > length
   fn take_split(&self, count: usize) -> (Self, Self);
+  /// returns a slice of `count` bytes from the end. panics if count > length
+  fn take_end(&self, count: usize) -> Self;
+  /// split the stream at the `count` byte offset from the ed. panics if count > length
+  fn take_split_end(&self, count: usize) -> (Self, Self);
 }
 
 fn star(r_u8: &u8) -> u8 {
@@ -360,6 +368,13 @@ impl<'a> InputIter for &'a [u8] {
     self.iter().position(|b| predicate(*b))
   }
   #[inline]
+  fn position_last<P>(&self, predicate: P) -> Option<usize>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    self.iter().rev().position(|b| predicate(*b))
+  }
+  #[inline]
   fn slice_index(&self, count: usize) -> Option<usize> {
     if self.len() >= count {
       Some(count)
@@ -378,6 +393,14 @@ impl<'a> InputTake for &'a [u8] {
   fn take_split(&self, count: usize) -> (Self, Self) {
     let (prefix, suffix) = self.split_at(count);
     (suffix, prefix)
+  }
+  #[inline]
+  fn take_end(&self, count: usize) -> Self {
+    &self[self.len()-count..]
+  }
+  #[inline]
+  fn take_split_end(&self, count: usize) -> (Self, Self) {
+    self.split_at(self.len() - count)
   }
 }
 
@@ -398,6 +421,17 @@ impl<'a> InputIter for &'a str {
     P: Fn(Self::Item) -> bool,
   {
     for (o, c) in self.char_indices() {
+      if predicate(c) {
+        return Some(o);
+      }
+    }
+    None
+  }
+  fn position_last<P>(&self, predicate: P) -> Option<usize>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    for (o, c) in self.char_indices().rev() {
       if predicate(c) {
         return Some(o);
       }
@@ -430,6 +464,18 @@ impl<'a> InputTake for &'a str {
   #[inline]
   fn take_split(&self, count: usize) -> (Self, Self) {
     (&self[count..], &self[..count])
+  }
+
+  #[inline]
+  fn take_end(&self, count: usize) -> Self {
+    &self[self.len()-count..]
+  }
+
+  // return byte index
+  #[inline]
+  fn take_split_end(&self, count: usize) -> (Self, Self) {
+    let split = self.len() - count;
+    (&self[..split], &self[split..])
   }
 }
 
@@ -691,6 +737,257 @@ impl<'a> InputTakeAtPosition for &'a str {
   }
 }
 
+/// methods to take as much input from the end as possible until the provided function returns true for the current element
+pub trait InputTakeAtPositionEnd: Sized {
+  /// the current input type is a sequence of that `Item` type.
+  ///
+  /// example: `u8` for `&[u8]` or `char` for &str`
+  type Item;
+
+  /// looks for the last element of the input type for which the condition returns true,
+  /// and returns the input from this position
+  ///
+  /// *streaming version*: if no element is found matching the condition, this will return `Incomplete`
+  fn split_at_position_end<P, E: ParseError<Self>>(&self, predicate: P) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool;
+
+  /// looks for the last element of the input type for which the condition returns true
+  /// and returns the input from this position
+  ///
+  /// fails if the produced slice is empty
+  ///
+  /// *streaming version*: if no element is found matching the condition, this will return `Incomplete`
+  fn split_at_position1_end<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+    e: ErrorKind,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool;
+
+  /// looks for the last element of the input type for which the condition returns true,
+  /// and returns the input from this position
+  ///
+  /// *complete version*: if no element is found matching the condition, this will return the whole input
+  fn split_at_position_end_complete<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool;
+
+  /// looks for the first element of the input type for which the condition returns true
+  /// and returns the input from this position
+  ///
+  /// fails if the produced slice is empty
+  ///
+  /// *complete version*: if no element is found matching the condition, this will return the whole input
+  fn split_at_position1_end_complete<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+    e: ErrorKind,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool;
+}
+
+impl<T: InputLength + InputIter + InputTake + Clone + UnspecializedInput> InputTakeAtPositionEnd
+  for T
+{
+  type Item = <T as InputIter>::Item;
+
+  fn split_at_position_end<P, E: ParseError<Self>>(&self, predicate: P) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match self.position_last(predicate) {
+      Some(n) => {
+        let (end, start) = self.take_split(n);
+        Ok((start, end))
+      },
+      None => Err(Err::Incomplete(Needed::new(1))),
+    }
+  }
+
+  fn split_at_position1_end<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+    e: ErrorKind,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match self.position_last(predicate) {
+      Some(0) => Err(Err::Error(E::from_error_kind(self.clone(), e))),
+      Some(n) => {
+        let (end, start) = self.take_split(n);
+        Ok((start, end))
+      },
+      None => Err(Err::Incomplete(Needed::new(1))),
+    }
+  }
+
+  fn split_at_position_end_complete<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match self.split_at_position_end(predicate) {
+      Err(Err::Incomplete(_)) => Ok(self.take_split(self.input_len())),
+      res => res,
+    }
+  }
+
+  fn split_at_position1_end_complete<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+    e: ErrorKind,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match self.split_at_position1_end(predicate, e) {
+      Err(Err::Incomplete(_)) => {
+        if self.input_len() == 0 {
+          Err(Err::Error(E::from_error_kind(self.clone(), e)))
+        } else {
+          Ok(self.take_split(self.input_len()))
+        }
+      }
+      res => res,
+    }
+  }
+}
+
+impl<'a> InputTakeAtPositionEnd for &'a [u8] {
+  type Item = u8;
+
+  fn split_at_position_end<P, E: ParseError<Self>>(&self, predicate: P) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match (0..self.len()).rfind(|b| predicate(self[*b])) {
+      Some(i) => Ok((&self[..=1], &self[i+1..])),
+      None => Err(Err::Incomplete(Needed::new(1))),
+    }
+  }
+
+  fn split_at_position1_end<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+    e: ErrorKind,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match (0..self.len()).rfind(|b| predicate(self[*b])) {
+      Some(0) => Err(Err::Error(E::from_error_kind(self, e))),
+      Some(i) => Ok((&self[..=1], &self[i+1..])),
+      None => Err(Err::Incomplete(Needed::new(1))),
+    }
+  }
+
+  fn split_at_position_end_complete<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match (0..self.len()).rfind(|b| predicate(self[*b])) {
+      Some(i) => Ok((&self[..=i], &self[i+1..])),
+      None => Ok(self.take_split(self.input_len())),
+    }
+  }
+
+  fn split_at_position1_end_complete<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+    e: ErrorKind,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match (0..self.len()).rfind(|b| predicate(self[*b])) {
+      Some(0) => Err(Err::Error(E::from_error_kind(self, e))),
+      Some(i) => Ok((&self[..=i], &self[i+1..])),
+      None => {
+        if self.len() == 0 {
+          Err(Err::Error(E::from_error_kind(self, e)))
+        } else {
+          Ok(self.take_split(self.input_len()))
+        }
+      }
+    }
+  }
+}
+
+impl<'a> InputTakeAtPositionEnd for &'a str {
+  type Item = char;
+
+  fn split_at_position_end<P, E: ParseError<Self>>(&self, predicate: P) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match self.rfind(predicate) {
+      Some(i) => Ok((&self[..=i], &self[i+1..])),
+      None => Err(Err::Incomplete(Needed::new(1))),
+    }
+  }
+
+  fn split_at_position1_end<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+    e: ErrorKind,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match self.rfind(predicate) {
+      Some(0) => Err(Err::Error(E::from_error_kind(self, e))),
+      Some(i) => Ok((&self[..=i], &self[i+1..])),
+      None => Err(Err::Incomplete(Needed::new(1))),
+    }
+  }
+
+  fn split_at_position_end_complete<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match self.rfind(predicate) {
+      Some(i) => Ok((&self[..=i], &self[i+1..])),
+      None => Ok(self.take_split(self.input_len())),
+    }
+  }
+
+  fn split_at_position1_end_complete<P, E: ParseError<Self>>(
+    &self,
+    predicate: P,
+    e: ErrorKind,
+  ) -> IResult<Self, Self, E>
+  where
+    P: Fn(Self::Item) -> bool,
+  {
+    match self.rfind(predicate) {
+      Some(0) => Err(Err::Error(E::from_error_kind(self, e))),
+      Some(i) => Ok((&self[..=i], &self[i+1..])),
+      None => {
+        if self.len() == 0 {
+          Err(Err::Error(E::from_error_kind(self, e)))
+        } else {
+          Ok(self.take_split(self.input_len()))
+        }
+      }
+    }
+  }
+}
+
 /// indicates wether a comparison was successful, an error, or
 /// if more data was needed
 #[derive(Debug, PartialEq)]
@@ -701,6 +998,14 @@ pub enum CompareResult {
   Incomplete,
   /// comparison failed
   Error,
+}
+
+/// allow comparison with both input start and end
+pub trait CompareBiDir<T> {
+  /// compares self bidirectionally
+  fn compare_dir(&self, t: T, start: bool) -> CompareResult;
+  /// case-insensitive bidirectional compare
+  fn compare_no_case_dir(&self, t: T, start: bool) -> CompareResult;
 }
 
 /// abstracts comparison operations
@@ -717,10 +1022,26 @@ pub trait Compare<T> {
   fn compare_no_case(&self, t: T) -> CompareResult;
 }
 
-impl<'a, 'b> Compare<&'b [u8]> for &'a [u8] {
+impl<T: CompareBiDir<O>, O> Compare<O> for T {
   #[inline(always)]
-  fn compare(&self, t: &'b [u8]) -> CompareResult {
-    let pos = self.iter().zip(t.iter()).position(|(a, b)| a != b);
+  fn compare(&self, t: O) -> CompareResult {
+    self.compare_dir(t, true)
+  }
+
+  #[inline(always)]
+  fn compare_no_case(&self, t: O) -> CompareResult {
+    self.compare_no_case_dir(t, true)
+  }
+}
+
+impl<'a, 'b> CompareBiDir<&'b [u8]> for &'a [u8] {
+  #[inline(always)]
+  fn compare_dir(&self, t: &'b [u8], start: bool) -> CompareResult {
+    let iter = self.iter();
+    let iter: Box<dyn Iterator<Item = &u8>> = if start { Box::new(iter) } else { Box::new(iter.rev()) };
+    let t_iter = t.iter();
+    let t_iter: Box<dyn Iterator<Item = &u8>> = if start { Box::new(t_iter) } else { Box::new(t_iter.rev()) };
+    let pos = iter.zip(t_iter).position(|(a, b)| a != b);
 
     match pos {
       Some(_) => CompareResult::Error,
@@ -751,14 +1072,18 @@ impl<'a, 'b> Compare<&'b [u8]> for &'a [u8] {
   }
 
   #[inline(always)]
-  fn compare_no_case(&self, t: &'b [u8]) -> CompareResult {
+  fn compare_no_case_dir(&self, t: &'b [u8], start: bool) -> CompareResult {
     let len = self.len();
     let blen = t.len();
     let m = if len < blen { len } else { blen };
-    let reduced = &self[..m];
+    let reduced = if start { &self[..m] } else { &self[(len-m)..] };
     let other = &t[..m];
+    let iter = reduced.iter();
+    let iter: Box<dyn Iterator<Item = &u8>> = if start { Box::new(iter) } else { Box::new(iter.rev()) };
+    let t_iter = other.iter();
+    let t_iter: Box<dyn Iterator<Item = &u8>> = if start { Box::new(t_iter) } else { Box::new(t_iter.rev()) };
 
-    if !reduced.iter().zip(other).all(|(a, b)| match (*a, *b) {
+    if !iter.zip(t_iter).all(|(a, b)| match (*a, *b) {
       (0..=64, 0..=64) | (91..=96, 91..=96) | (123..=255, 123..=255) => a == b,
       (65..=90, 65..=90) | (97..=122, 97..=122) | (65..=90, 97..=122) | (97..=122, 65..=90) => {
         *a | 0b00_10_00_00 == *b | 0b00_10_00_00
@@ -777,14 +1102,13 @@ impl<'a, 'b> Compare<&'b [u8]> for &'a [u8] {
 impl<
     T: InputLength + InputIter<Item = u8> + InputTake + UnspecializedInput,
     O: InputLength + InputIter<Item = u8> + InputTake,
-  > Compare<O> for T
+  > CompareBiDir<O> for T
 {
   #[inline(always)]
-  fn compare(&self, t: O) -> CompareResult {
-    let pos = self
-      .iter_elements()
-      .zip(t.iter_elements())
-      .position(|(a, b)| a != b);
+  fn compare_dir(&self, t: O, start: bool) -> CompareResult {
+    let iter = self.iter_elements();
+    let iter: Box<dyn Iterator<Item = u8>> = if start { Box::new(iter) } else { Box::new(iter.rev()) };
+    let pos = iter.zip(t.iter_elements()).position(|(a, b)| a != b);
 
     match pos {
       Some(_) => CompareResult::Error,
@@ -799,15 +1123,16 @@ impl<
   }
 
   #[inline(always)]
-  fn compare_no_case(&self, t: O) -> CompareResult {
+  fn compare_no_case_dir(&self, t: O, start: bool) -> CompareResult {
     let len = self.input_len();
     let blen = t.input_len();
     let m = if len < blen { len } else { blen };
-    let reduced = self.take(m);
+    let reduced = if start { self.take(m) } else { self.take_end(m) };
     let other = t.take(m);
+    let iter = reduced.iter_elements();
+    let iter: Box<dyn Iterator<Item = u8>> = if start { Box::new(iter) } else { Box::new(iter.rev()) };
 
-    if !reduced
-      .iter_elements()
+    if !iter
       .zip(other.iter_elements())
       .all(|(a, b)| match (a, b) {
         (0..=64, 0..=64) | (91..=96, 91..=96) | (123..=255, 123..=255) => a == b,
@@ -826,21 +1151,25 @@ impl<
   }
 }
 
-impl<'a, 'b> Compare<&'b str> for &'a [u8] {
+impl<'a, 'b> CompareBiDir<&'b str> for &'a [u8] {
   #[inline(always)]
-  fn compare(&self, t: &'b str) -> CompareResult {
-    self.compare(AsBytes::as_bytes(t))
+  fn compare_dir(&self, t: &'b str, start: bool) -> CompareResult {
+    self.compare_dir(AsBytes::as_bytes(t), start)
   }
   #[inline(always)]
-  fn compare_no_case(&self, t: &'b str) -> CompareResult {
-    self.compare_no_case(AsBytes::as_bytes(t))
+  fn compare_no_case_dir(&self, t: &'b str, start: bool) -> CompareResult {
+    self.compare_no_case_dir(AsBytes::as_bytes(t), start)
   }
 }
 
-impl<'a, 'b> Compare<&'b str> for &'a str {
+impl<'a, 'b> CompareBiDir<&'b str> for &'a str {
   #[inline(always)]
-  fn compare(&self, t: &'b str) -> CompareResult {
-    let pos = self.chars().zip(t.chars()).position(|(a, b)| a != b);
+  fn compare_dir(&self, t: &'b str, start: bool) -> CompareResult {
+    let iter = self.chars();
+    let iter: Box<dyn Iterator<Item = char>> = if start { Box::new(iter) } else { Box::new(iter.rev()) };
+    let t_iter = t.chars();
+    let t_iter: Box<dyn Iterator<Item = char>> = if start { Box::new(t_iter) } else { Box::new(t_iter.rev()) };
+    let pos = iter.zip(t_iter).position(|(a, b)| a != b);
 
     match pos {
       Some(_) => CompareResult::Error,
@@ -856,10 +1185,13 @@ impl<'a, 'b> Compare<&'b str> for &'a str {
 
   //FIXME: this version is too simple and does not use the current locale
   #[inline(always)]
-  fn compare_no_case(&self, t: &'b str) -> CompareResult {
-    let pos = self
-      .chars()
-      .zip(t.chars())
+  fn compare_no_case_dir(&self, t: &'b str, start: bool) -> CompareResult {
+    let iter = self.chars();
+    let iter: Box<dyn Iterator<Item = char>> = if start { Box::new(iter) } else { Box::new(iter.rev()) };
+    let t_iter = t.chars();
+    let t_iter: Box<dyn Iterator<Item = char>> = if start { Box::new(t_iter) } else { Box::new(t_iter.rev()) };
+    let pos = iter
+      .zip(t_iter)
       .position(|(a, b)| a.to_lowercase().zip(b.to_lowercase()).any(|(a, b)| a != b));
 
     match pos {
@@ -1084,6 +1416,11 @@ macro_rules! array_impls {
         fn position<P>(&self, predicate: P) -> Option<usize>
           where P: Fn(Self::Item) -> bool {
           (&self[..]).position(predicate)
+        }
+
+        fn position_last<P>(&self, predicate: P) -> Option<usize>
+          where P: Fn(Self::Item) -> bool {
+          (&self[..]).position_last(predicate)
         }
 
         fn slice_index(&self, count: usize) -> Option<usize> {
